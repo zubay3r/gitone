@@ -205,3 +205,96 @@ function theme_scanner_page() {
     </div>
     <?php
 }
+
+
+
+// Function to display all modified files in the admin panel
+function display_all_modified_files() {
+    // Get a list of all files in the "root" directory
+    $root_files = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(ABSPATH, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+
+    // Define the list of files or directories to ignore
+    $ignore_list = ['cache'];
+
+    // Initialize an array to store file information
+    $files_info = [];
+
+    // Check if there are any files in the "root" directory
+    if (!empty($root_files)) {
+        foreach ($root_files as $file) {
+            $file_path = $file->getPathname();
+            
+            // Check if the file or directory should be ignored (This function is for ignoring cache folder)
+            $should_ignore = false;
+            foreach ($ignore_list as $ignore_item) {
+                if (stripos($file_path, $ignore_item) !== false) {
+                    $should_ignore = true;
+                    break;
+                }
+            }
+
+            if ($should_ignore) {
+                continue;
+            }
+
+            // Check if it's a file
+            if ($file->isFile()) {
+                // Get the last modified time of the file
+                $modified_time = $file->getMTime();
+                // Store the file information in the array
+                $files_info[] = [
+                    'path' => $file_path,
+                    'modified_time' => $modified_time,
+                ];
+            }
+        }
+
+        // Sort the files by their last modified time in descending order
+        usort($files_info, function ($a, $b) {
+            return $b['modified_time'] - $a['modified_time'];
+        });
+
+        echo '<div class="wrap">';
+        echo '<h2>All Modified Files</h2>';
+        echo '<table class="widefat">';
+        echo '<thead>
+        <tr>
+        <th>File</th>
+        <th>Last Modified</th>
+        </tr>
+        </thead>';
+        echo '<tbody>';
+        foreach ($files_info as $file_info) {
+            $modified_time = $file_info['modified_time'];
+            $current_time = time();
+            $time_diff = $current_time - $modified_time;
+
+            // Determine the time difference string
+            if ($time_diff < 60) {
+                $time_diff_modified = $time_diff . ' seconds ago';
+            } elseif ($time_diff < 3600) {
+                $time_diff_modified = round($time_diff / 60) . ' minutes ago';
+            } elseif ($time_diff < 86400) {
+                $time_diff_modified = round($time_diff / 3600) . ' hours ago';
+            } else {
+                $time_diff_modified = round($time_diff / 86400) . ' days ago';
+            }
+
+            echo '<tr>';
+            echo '<td>' . esc_html($file_info['path']) . '</td>';
+            echo '<td>' . esc_html($time_diff_modified) . '</td>'; // Display the duration since last modification
+            echo '</tr>';
+        }
+        echo '</tbody>';
+        echo '</table>';
+        echo '</div>';
+    } else {
+        echo '<div class="wrap">';
+        echo '<h2>All Modified Files</h2>';
+        echo '<p>No files found.</p>';
+        echo '</div>';
+    }
+}

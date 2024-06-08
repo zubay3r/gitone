@@ -1,0 +1,390 @@
+// Virus Protection Code
+
+// Activation hook
+register_activation_hook(__FILE__, 'theme_scanner_activate');
+function theme_scanner_activate() {
+    global $wpdb;
+    $suspicious_table_name = $wpdb->prefix . 'suspicious_files';
+    $neutralized_table_name = $wpdb->prefix . 'neutralized_files';
+
+    // Create table (Suspicious Files)
+    $charset_collate = $wpdb->get_charset_collate();
+    $sql_suspicious = "CREATE TABLE $suspicious_table_name (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        file varchar(255) NOT NULL,
+        line int NOT NULL,
+        pattern varchar(255) NOT NULL,
+        risk_level varchar(20) NOT NULL,  -- Column for risk level
+        modified datetime NOT NULL,
+        detected datetime NOT NULL,
+        PRIMARY KEY  (id),
+        UNIQUE KEY unique_file_line (file(191), line)
+    ) $charset_collate;";
+    
+    // Create table (Neutralized Files)
+    $sql_neutralized = "CREATE TABLE $neutralized_table_name (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        file varchar(255) NOT NULL,
+        line int NOT NULL,
+        pattern varchar(255) NOT NULL,
+        risk_level varchar(20) NOT NULL,  -- Column for risk level
+        modified datetime NOT NULL,
+        detected datetime NOT NULL,
+        PRIMARY KEY  (id),
+        UNIQUE KEY unique_file_line (file(191), line)
+    ) $charset_collate;";
+
+    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+    dbDelta($sql_suspicious);
+    dbDelta($sql_neutralized);
+
+    // Schedule daily scanning
+    if (!wp_next_scheduled('theme_scan_daily_event')) {
+        wp_schedule_event(time(), 'daily', 'theme_scan_daily_event');
+    }
+}
+
+// Deactivation hook
+register_deactivation_hook(__FILE__, 'theme_scanner_deactivate');
+function theme_scanner_deactivate() {
+    global $wpdb;
+    $suspicious_table_name = $wpdb->prefix . 'suspicious_files';
+    $neutralized_table_name = $wpdb->prefix . 'neutralized_files';
+
+    // Remove scheduled scanning
+    wp_clear_scheduled_hook('theme_scan_daily_event');
+
+}
+
+// Function to scan theme files
+function theme_scan_files() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'suspicious_files';
+
+    // Get the path to the current theme directory
+    $themes_dir = get_theme_root();
+
+    // Array to store suspicious patterns
+    $suspicious_patterns = array(
+        '/eval\s*\(/i' => 'High',
+        '/base64_decode\s*\(/i' => 'Medium',
+        '/system\s*\(/i' => 'None',
+        '/shell_exec\s*\(/i' => 'High',
+        '/exec\s*\(/i' => 'High',
+        '/passthru\s*\(/i' => 'High',
+        // Add more patterns as needed
+    );
+
+    // Get a list of theme files
+    $theme_files = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($themes_dir)
+    );
+
+    // Track found suspicious entries to handle removals
+    $found_entries = [];
+
+    // Loop through each theme file
+    foreach ($theme_files as $file) {
+        // Check if it's a PHP file
+        if ($file->isFile() && $file->getExtension() === 'php') {
+            // Read the file contents
+            $file_contents = file_get_contents($file->getPathname());
+
+            // Split the file contents into lines
+            $lines = explode("\n", $file_contents);
+
+            // Check for suspicious patterns
+            foreach ($suspicious_patterns as $pattern => $risk_level) {
+                foreach ($lines as $line_number => $line_content) {
+                    if (preg_match($pattern, $line_content)) {
+                        // Check if this file and line number already exists in the database
+                        $existing_entry = $wpdb->get_var($wpdb->prepare(
+                            "SELECT id FROM $table_name WHERE file = %s AND line = %d",
+                            $file->getPathname(), $line_number + 1
+                        ));
+
+                        if (!$existing_entry) {
+                            // If not, insert it into the database
+                            $wpdb->insert(
+                                $table_name,
+                                array(
+                                    'file' => $file->getPathname(),
+                                    'line' => $line_number + 1, // Line numbers start from 1
+                                    'pattern' => $pattern,
+                                    'risk_level' => $risk_level, // Set the risk level
+                                    'modified' => gmdate('Y-m-d H:i:s', filemtime($file->getPathname())), // Record the modification time
+                                    'detected' => current_time('mysql', 1) // Record the detection time in GMT
+                                )
+                            );
+                            $found_entries[] = $wpdb->insert_id;
+                        } else {
+                            // Update the modified time and detected time
+                            $wpdb->update(
+                                $table_name,
+                                array(
+                                    'modified' => gmdate('Y-m-d H:i:s', filemtime($file->getPathname())),
+                                    'detected' => current_time('mysql', 1)
+                                ),
+                                array('id' => $existing_entry)
+                            );
+                            $found_entries[] = $existing_entry;
+                        }
+                        break; // No need to continue checking patterns for this line
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove entries from the database that were not found in the latest scan
+    if (!empty($found_entries)) {
+        $found_entries_list = implode(',', array_map('intval', $found_entries));
+        $wpdb->query("DELETE FROM $table_name WHERE id NOT IN ($found_entries_list)");
+    }
+}
+
+// Hook the scanning function to the daily event
+add_action('theme_scan_daily_event', 'theme_scan_files');
+
+// Function to display suspicious files in the admin panel
+function display_suspicious_files() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'suspicious_files';
+
+    // Get the stored scan results, ordered by last modified time descending
+    $suspicious_files_list = $wpdb->get_results("SELECT * FROM $table_name ORDER BY modified DESC");
+
+    // Check if there are any suspicious files
+    if (!empty($suspicious_files_list)) {
+        echo '<h2>Suspicious Files</h2>';
+        echo '<table class="widefat">';
+        echo '<thead><tr><th>File</th><th>Line</th><th>Pattern</th><th>Risk Level</th><th>Last Modified</th><th>Detection Time</th><th>Actions</th></tr></thead>';
+        echo '<tbody>';
+        foreach ($suspicious_files_list as $file) {
+            $modified_time = strtotime($file->modified);
+            $time_diff_modified = human_time_diff($modified_time, current_time('timestamp'));
+            echo '<tr>';
+            echo '<td>' . esc_html($file->file) . '</td>';
+            echo '<td>' . esc_html($file->line) . '</td>';
+            echo '<td>' . (isset($file->pattern) ? esc_html($file->pattern) : 'N/A') . '</td>';
+
+            // Set color based on risk level
+            $color = '';
+            switch ($file->risk_level) {
+                case 'None':
+                    $color = 'blue';
+                    break;
+                case 'High':
+                    $color = 'red';
+                    break;
+                case 'Medium':
+                    $color = 'orange';
+                    break;
+                case 'Low':
+                    $color = 'green';
+                    break;
+                default:
+                    $color = 'black'; // Default color
+            }
+            echo '<td style="color: ' . $color . ';">' . esc_html($file->risk_level) . '</td>';
+            echo '<td>' . esc_html($time_diff_modified) . ' ago</td>';
+            echo '<td>' . esc_html(get_date_from_gmt($file->detected)) . '</td>';
+            echo '<td>';
+            echo '<form method="post" action="">';
+            echo '<input type="hidden" name="file_id" value="' . esc_attr($file->id) . '">';
+            echo '<input type="submit" class="button button-primary" name="neutralize_file" value="Neutralize" onclick="return confirm(\'Are you sure to perform this action?\');">';
+            echo '</form>';
+            echo '</td>';
+            echo '</tr>';
+        }
+        echo '</tbody>';
+        echo '</table>';
+    } else {
+        echo '<p>No suspicious files found.</p>';
+    }
+}
+
+// Function to handle the neutralization of a suspicious file
+function handle_neutralize_file() {
+    if (isset($_POST['neutralize_file'])) {
+        global $wpdb;
+        $suspicious_table_name = $wpdb->prefix . 'suspicious_files';
+        $neutralized_table_name = $wpdb->prefix . 'neutralized_files';
+
+        $file_id = intval($_POST['file_id']);
+        $file_data = $wpdb->get_row($wpdb->prepare("SELECT * FROM $suspicious_table_name WHERE id = %d", $file_id));
+
+        if ($file_data) {
+            // Remove the suspicious line from the file
+            $file_path = $file_data->file;
+            $lines = file($file_path);
+            unset($lines[$file_data->line - 1]); // Remove the line (adjusting for 0-based index)
+            file_put_contents($file_path, implode('', $lines));
+
+            // Move the record to the neutralized_files table
+            $wpdb->insert(
+                $neutralized_table_name,
+                array(
+                    'file' => $file_data->file,
+                    'line' => $file_data->line,
+                    'pattern' => $file_data->pattern,
+                    'risk_level' => $file_data->risk_level,
+                    'modified' => $file_data->modified,
+                    'detected' => $file_data->detected
+                )
+            );
+
+            // Remove the record from the suspicious_files table
+            $wpdb->delete($suspicious_table_name, array('id' => $file_id));
+        }
+    }
+}
+add_action('admin_post_neutralize_file', 'handle_neutralize_file');
+
+// Function to display the scanner page in the admin panel
+function theme_scanner_page() {
+    ?>
+    <div class="wrap">
+        <h1>Virus Scanner</h1>
+        <p>Click the button below to manually scan your theme files for suspicious code.</p>
+        <form method="post" action="">
+            <?php wp_nonce_field('theme_scanner_nonce', 'theme_scanner_nonce_field'); ?>
+            <input type="submit" class="button button-primary" name="scan_theme_files" value="Scan Theme Files">
+        </form>
+        <?php
+        if (isset($_POST['scan_theme_files']) && wp_verify_nonce($_POST['theme_scanner_nonce_field'], 'theme_scanner_nonce')) {
+            theme_scan_files();
+            display_suspicious_files();
+        } else {
+            display_suspicious_files();
+        }
+        ?>
+    </div>
+    <?php
+}
+
+
+// Function to display all modified files in the admin panel
+function display_all_modified_files() {
+    // Get a list of all files in the "root" directory
+    $root_files = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(ABSPATH, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+
+    // Define the list of files or directories to ignore
+    $ignore_list = ['cache'];
+
+    // Initialize arrays to store files categorized by modification time
+    $latest_files = [];
+    $last_7_days_files = [];
+    $last_15_days_files = [];
+
+    // Check if there are any files in the "root" directory
+    if (!empty($root_files)) {
+        foreach ($root_files as $file) {
+            $file_path = $file->getPathname();
+            
+            // Check if the file or directory should be ignored (This function is for ignoring cache folder)
+            $should_ignore = false;
+            foreach ($ignore_list as $ignore_item) {
+                if (stripos($file_path, $ignore_item) !== false) {
+                    $should_ignore = true;
+                    break;
+                }
+            }
+
+            if ($should_ignore) {
+                continue;
+            }
+
+            // Check if it's a file
+            if ($file->isFile()) {
+                // Get the last modified time of the file
+                $modified_time = $file->getMTime();
+                
+                // Determine the time difference in seconds
+                $time_diff_seconds = time() - $modified_time;
+
+                // Categorize files based on modification time
+                if ($time_diff_seconds <= 86400) { // Last 24 hours
+                    $latest_files[] = $file_path;
+                } elseif ($time_diff_seconds <= 604800) { // Last 7 days
+                    $last_7_days_files[] = $file_path;
+                } elseif ($time_diff_seconds <= 1296000) { // Last 15 days
+                    $last_15_days_files[] = $file_path;
+                }
+            }
+        }
+        
+
+        // Display categorized files using tabs
+echo '<div class="wrap">';
+echo '<h2>All Modified Files</h2>';
+
+
+// Latest files tab buttons
+echo '<button class="button button-primary" onclick="openTab(event, \'latest\')" id="defaultOpen">Last 24 Hours</button>';
+echo '&nbsp;';
+echo '<button class="button button-primary" onclick="openTab(event, \'last7days\')">Last 7 Days</button>';
+echo '&nbsp;';
+echo '<button class="button button-primary" onclick="openTab(event, \'last15days\')">Last 15 Days</button>';
+echo '&nbsp;';
+
+// Latest files tab content
+echo '<div id="latest" class="tabcontent">';
+display_files_in_table($latest_files);
+echo '</div>';
+
+// Last 7 days files tab content
+echo '<div id="last7days" class="tabcontent">';
+display_files_in_table($last_7_days_files);
+echo '</div>';
+
+// Last 15 days files tab content
+echo '<div id="last15days" class="tabcontent">';
+display_files_in_table($last_15_days_files);
+echo '</div>';
+echo '</div>'; // Close .wrap
+
+
+        // JavaScript to handle tab functionality and activate the default tab
+        echo '<script>
+        document.getElementById("defaultOpen").click();
+        function openTab(evt, tabName) {
+            var i, tabcontent, tablinks;
+            tabcontent = document.getElementsByClassName("tabcontent");
+            for (i = 0; i < tabcontent.length; i++) {
+                tabcontent[i].style.display = "none";
+            }
+            tablinks = document.getElementsByClassName("tablink");
+            for (i = 0; i < tablinks.length; i++) {
+                tablinks[i].className = tablinks[i].className.replace(" active", "");
+            }
+            document.getElementById(tabName).style.display = "block";
+            evt.currentTarget.className += " active";
+        }
+        </script>';
+    } else {
+        echo '<div class="wrap">';
+        echo '<h2>All Modified Files</h2>';
+        echo '<p>No files found.</p>';
+        echo '</div>';
+    }
+}
+
+// Helper function to display files in a table
+function display_files_in_table($files) {
+    if (!empty($files)) {
+        echo '&nbsp;';
+        echo '<table class="widefat">';
+        echo '<thead><tr><th>File</th></tr></thead>';
+        echo '<tbody>';
+        foreach ($files as $file) {
+            echo '<tr><td>' . esc_html($file) . '</td></tr>';
+        }
+        echo '</tbody></table>';
+    } else {
+        echo '<p>No files found.</p>';
+    }
+}
